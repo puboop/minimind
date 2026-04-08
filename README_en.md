@@ -34,7 +34,7 @@
 * This open-source project aims to train an ultra-small language model MiniMind with approximately 64M parameters entirely from scratch, using only 3 CNY in cost and 2 hours of training time.
 * The MiniMind series is extremely lightweight, with the smallest version on the main branch being approximately $\frac{1}{2700}$ the size of GPT-3, striving to enable even ordinary personal GPUs to quickly complete training and reproduction.
 * The project also open-sources the minimalist structure and complete training pipeline of large models, covering the entire process code for MoE, data cleaning, Pretraining, Supervised Fine-Tuning (SFT), LoRA, RLHF (DPO), RLAIF (PPO / GRPO / CISPO), Tool Use, Agentic RL, Adaptive Thinking, and Model Distillation.
-* MiniMind has also been extended to a visual multimodal version [MiniMind-V](https://github.com/jingyaogong/minimind-v).
+* MiniMind has also been extended to a visual multimodal version [MiniMind-V](https://github.com/jingyaogong/minimind-v), a diffusion language model (MiniMind-dLM), and a linear attention model (MiniMind-Linear), See [Discussion](https://github.com/jingyaogong/minimind/discussions) for details.
 * All core algorithm code in the project is implemented from scratch using native PyTorch, without relying on high-level abstract interfaces provided by third-party libraries.
 * This is not only a full-stage open-source reproduction project for large language models, but also a tutorial oriented towards LLM introduction and practice.
 * We hope this project can provide a reproducible, understandable, and extensible starting point for more people, to share the joy of creation together and promote the progress of the broader AI community.
@@ -94,6 +94,7 @@ Meanwhile, third-party large model frameworks and tool libraries, such as `trans
 - Supports evaluation on third-party benchmark suites such as C-Eval, C-MMLU, OpenBookQA, etc., and supports RoPE long context extrapolation through YaRN.
 - Provides a minimalist server compatible with the OpenAI API protocol, convenient for integrating with third-party Chat UIs such as FastGPT, Open-WebUI, etc., and supports `reasoning_content`, `tool_calls`, `open_thinking`.
 - Provides a minimalist chat WebUI based on Streamlit, supporting thinking display, tool selection, and multi-turn Tool Call.
+- Includes experimental extensions: diffusion language model ([dLM](https://github.com/jingyaogong/minimind/discussions/618)) and linear attention model ([Linear Attention](https://github.com/jingyaogong/minimind/discussions/704)), both can be continued-trained from the main AR model.
 
 #### 🎉 Released Model List
 
@@ -1217,7 +1218,7 @@ python train_agent.py
 
 > MiniMind optimization trends during the Agentic RL training stage
 
-Here I'll also briefly mention the `rollout_engine`. The so-called "training-inference separation" means decoupling **parameter updates** and **trajectory rollout**: the training side handles policy optimization, while the rollout side handles high-throughput sampling. From the top level, they uniformly present as "give me a prompt, I'll return rollout results; after training is done, sync the new weights back." Therefore, the training script doesn't need to care whether the underlying implementation is local `generate` or a remote `inference` engine.
+Here I'll also briefly mention the `rollout_engine`. The so-called "training-inference separation" means decoupling **parameter updates** and **trajectory rollout**: the training side handles policy optimization, while the rollout side handles high-throughput sampling. From the top level, they uniformly present as "give me a prompt, I'll return rollout results; after training is done, sync the new weights back." Therefore, the training script doesn't need to care whether the underlying implementation is local `generate` or a remote `inference` engine. Note that the current implementation is still **synchronous** (sample a batch, then update), not yet asynchronous training with a pure rollout buffer.
 
 ![rl-structure](./images/rl-structure.jpg)
 
@@ -1305,9 +1306,11 @@ Let us converge back to the "**unified framework**", reorganizing the table show
 
 Subjective/objective comparison based on `minimind-3 (64M)` under the same random seed and other hyperparameters, for reference:
 
-**[A]** minimind-3 (64M, SFT)
-**[B]** minimind-3 (64M, GRPO)
-**[C]** minimind-3 (64M, Agent-CISPO)
+[A] minimind-3 (64M, SFT)
+
+[B] minimind-3 (64M, GRPO)
+
+[C] minimind-3 (64M, Agent-CISPO)
 
 ### Test 1: Subjective Q&A Comparison
 
@@ -1397,10 +1400,13 @@ So if the task objective is ToolUse, lightweight multi-step calling, and verifia
 
 > Note: The following comparison is only for experiential reference, not a strict benchmark; sample size is limited and involves subjectivity.
 
-**[A]** minimind-3 (0.06B)
-**[B]** minimind-3-moe (0.2B-A0.06B)
-**[C]** [baby-llama2-chinese (0.2B)](https://github.com/DLLXW/baby-llama2-chinese)
-**[D]** [chatlm-mini-chinese (0.2B)](https://github.com/charent/ChatLM-mini-Chinese)
+[A] minimind-3 (0.06B)
+
+[B] minimind-3-moe (0.2B-A0.06B)
+
+[C] [baby-llama2-chinese (0.2B)](https://github.com/DLLXW/baby-llama2-chinese)
+
+[D] [chatlm-mini-chinese (0.2B)](https://github.com/charent/ChatLM-mini-Chinese)
 
 ### Test 3: Q&A
 

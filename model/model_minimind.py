@@ -260,13 +260,11 @@ class Attention(nn.Module):
         # ========== 1. 注意力头配置（支持 GQA 分组查询注意力）==========
         # KV 头数量（不指定则等于 Q 头数，即普通 MHA）
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
-        self.n_local_heads = config.num_attention_heads  # Q 头总数
-        self.n_local_kv_heads = self.num_key_value_heads  # KV 头总数
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads  # 每个 KV 头需要重复的次数（GQA）
-        self.head_dim = config.head_dim  # 每个头的维度
-
-        # ========== 2. 投影层（Q/K/V/O）==========
-        # Q 投影：hidden_size → Q头总数 × 头维度
+        self.n_local_heads = config.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = config.head_dim
+        self.is_causal = True
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
         # K 投影：hidden_size → KV头总数 × 头维度
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
@@ -318,45 +316,16 @@ class Attention(nn.Module):
 
         # 如果需要缓存，保存当前 KV
         past_kv = (xk, xv) if use_cache else None
-
-        # ========== 6. GQA：KV 头重复，匹配 Q 头数量 ==========
-        xq = xq.transpose(1, 2)  # 调转1，2维 (bsz, n_heads, seq_len, head_dim) [32, 8, 340, 96]
-        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)  # K 重复 n_rep 次
-        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)  # V 重复 n_rep 次
-
-        # ========== 7. 计算注意力得分 ==========
-        if (
-                self.flash and (seq_len > 1) and
-                (past_key_value is None) and
-                (attention_mask is None or torch.all(attention_mask == 1))
-        ):
-            # 启用 FlashAttention：更快、更省显存  内置注意力计算
-            output = F.scaled_dot_product_attention(
-                xq, xk, xv,  # 1. 三个核心输入：查询、键、值
-                dropout_p=self.dropout if self.training else 0.0,  # 2. 训练/推理切换 dropout
-                is_causal=True  # 3. 因果掩码：强制模型看不到未来的 token
-            )
+        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
-            # 手动实现注意力（兼容旧环境）
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)  # Q*K^T / sqrt(head_dim)
-
-            # 因果掩码：上三角置为 -inf，防止看到未来 token
-            scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-
-            # 注意力掩码（padding 部分屏蔽）
-            if attention_mask is not None:
-                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-
-            # Softmax + Dropout + 乘 V
-            attn_weights = F.softmax(scores.float(), dim=-1).type_as(xq)
-            attn_weights = self.attn_dropout(attn_weights)
-            output = attn_weights @ xv
-
-        # ========== 8. 输出拼接 + 投影 ==========
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)  # 多头拼接回 (bsz, seq_len, hidden_size)
-        output = self.resid_dropout(self.o_proj(output))  # 输出投影 + 残差 dropout
-
-        # 返回：注意力输出、最新KV缓存（用于下一次生成）
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
 
