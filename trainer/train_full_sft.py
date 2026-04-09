@@ -10,7 +10,7 @@ import warnings
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
-from torch import optim, nn
+from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
@@ -133,7 +133,9 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 根据进程的数量，将数据集划分成多个子集，每个进程负责处理其中一个子集的数据
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    # 自动混合精度训练，动态调整缩放因子，在保证模型训练精度的同时，利用 16 位浮点数的计算优势，提高训练速度
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
@@ -150,11 +152,12 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
+    # 包装分布式训练模型
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
-    
-    # ========== 8. 开始训练 ==========
+
+    # ========== 8. 开始训练 全量参数学习微调结构化数据==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()

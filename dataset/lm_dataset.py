@@ -1,5 +1,4 @@
 import json
-import json
 import os
 import random
 
@@ -31,7 +30,7 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
     return conversations
 
 
-def post_processing_chat(prompt_content, empty_think_ratio=0.2):
+def post_processing_chat(prompt_content: str, empty_think_ratio=0.2):
     # 以80%概率移除空思考标签
     if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
         prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
@@ -121,30 +120,63 @@ class PretrainDataset(Dataset):
 
 
 class SFTDataset(Dataset):
+    """
+    全量微调模型回答结构化数据输出与理解
+    """
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
+        # 将传入的tokenizer保存为类的属性，tokenizer通常用于将文本转换为模型可以处理的token等操作
         self.tokenizer = tokenizer
+        # 将传入的最大长度保存为类的属性，这个最大长度可能用于限制输入文本的长度
         self.max_length = max_length
-        features = Features({'conversations': [
-            {'role' : Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'),
-             'tools': Value('string'), 'tool_calls': Value('string')}]})
+        # Features 就像是一个用来描述数据集特征结构的模板。在你之前的代码里，用它来定义了数据集中 conversations
+        # 这个部分的详细样子，每个子部分是什么类型都能靠它规定。
+        # Value 是用来指定数据具体类型的。比如在定义 conversations 的特征时，用 Value('string') 来说明像 role 、content
+        # 这些字段的数据类型是字符串。简单理解，Value 就是用来给数据定个 “型”，告诉程序这部分数据是什么类型的。
+        features = Features({'conversations': [{
+            'role'             : Value('string'),
+            'content'          : Value('string'),
+            'reasoning_content': Value('string'),
+            'tools'            : Value('string'),
+            'tool_calls'       : Value('string')
+        }]})
+        # 从指定路径的jsonl文件中加载数据集，只加载'train'分割的数据，并应用上面定义的特征
         self.samples = load_dataset('json', data_files=jsonl_path, split='train', features=features)
+        # 获取tokenizer中表示开始的token对应的id，这里通过对特定字符串进行编码得到，add_special_tokens=False表示不添加额外的特殊标记
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        # 获取tokenizer中表示结束的token对应的id，同样通过对特定字符串进行编码得到，add_special_tokens=False表示不添加额外的特殊标记
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
 
     def __len__(self):
+        # 返回数据集中样本的数量，也就是self.samples的长度
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
+        """
+        提取出工具列表，进行工具回调生成
+        :param conversations: 包含多个批次的数据
+        :return:
+        """
+        # 初始化一个空列表，用于存储处理后的消息
         messages = []
+        # 初始化tools为None，tools可能用于一些特定的处理
         tools = None
+        # 遍历对话中的每一条消息
         for message in conversations:
+            # 将消息转换为字典形式
             message = dict(message)
+            # 如果消息的角色是"system"并且包含"tools"字段
             if message.get("role") == "system" and message.get("tools"):
+                # 如果tools是字符串形式，将其解析为json对象，否则直接使用
                 tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            # 如果消息包含"tool_calls"字段并且是字符串形式
             if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+                # 将其解析为json对象
                 message["tool_calls"] = json.loads(message["tool_calls"])
+            # 将处理后的消息添加到messages列表中
             messages.append(message)
+        # 使用tokenizer的apply_chat_template方法生成聊天提示，tokenize=False表示不进行token化，
+        # add_generation_prompt=False表示不添加生成提示，传入tools
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -153,36 +185,60 @@ class SFTDataset(Dataset):
         )
 
     def generate_labels(self, input_ids):
+        """
+        提取self.bos_id【'<|im_start|>assistant\n'】与self.eos_id【'<|im_end|>\n'】之间的内容作为label
+        :param input_ids:
+        :return:
+        """
+        # 初始化一个长度与input_ids相同的列表，所有元素为-100，这个列表用于存储标签
         labels = [-100] * len(input_ids)
+        # 初始化索引i为0
         i = 0
+        # 遍历input_ids
         while i < len(input_ids):
+            # 如果当前位置开始的一段id与开始标记的id相同
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                # 计算开始位置
                 start = i + len(self.bos_id)
+                # 初始化结束位置为开始位置
                 end = start
+                ##### 找到结束标记的位置
                 while end < len(input_ids):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                # 对于开始和结束标记之间的部分，将标签设置为对应的input_ids
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     labels[j] = input_ids[j]
+                # 更新索引i，跳过当前这段内容
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
+                # 如果当前位置不是开始标记，直接移动到下一个位置
                 i += 1
+        # 返回生成的标签
         return labels
 
     def __getitem__(self, index):
+        # 获取指定索引的样本
         sample = self.samples[index]
+        # 对样本中的对话进行预处理
         conversations = pre_processing_chat(sample['conversations'])
+        # 根据对话生成聊天提示
         prompt = self.create_chat_prompt(conversations)
+        # 对生成的聊天提示进行后处理 完全就是字符串形式
         prompt = post_processing_chat(prompt)
+        # 将聊天提示转换为token id，并截取到最大长度
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        # 使用填充token id将input_ids填充到最大长度
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        # 根据input_ids生成标签
         labels = self.generate_labels(input_ids)
         # # === 调试打印 ===
         # print(f"\n--- Sample {index} ---")
         # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
         #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
         # # ================
+        # 将input_ids和labels转换为torch张量并返回
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 
