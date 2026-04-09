@@ -114,6 +114,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 f'aux_loss: {current_aux_loss:.4f}, '
                 f'lr: {current_lr:.8f}, '
                 f'epoch_time: {eta_min:.1f}min'
+                f'time: {time.strftime("%Y-%m-%d %H:%M:%S")}'
             )
             # 如果传入了wandb，则将相关指标记录到wandb中
             if wandb: wandb.log({"loss"    : current_loss, "logits_loss": current_logits_loss,
