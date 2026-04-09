@@ -7,3 +7,4 @@ docs-minimind/
 
 *.pth
 test/
+model_learn_tokenizer/

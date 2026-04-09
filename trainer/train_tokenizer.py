@@ -1,57 +1,92 @@
 # 注：不建议再重复训练tokenizer（“词典”），MiniMind已自带，此脚本仅供学习和参考。基于不同词典训练的模型将导致输出完全不统一，降低社区的模型复用性
 # Note: It is not recommended to re-train the tokenizer. MiniMind already includes one. This script is for learning and reference only. Training models with different tokenizers will lead to inconsistent outputs and reduce model reusability in the community.
-import os
 import json
+import os
+
 from tokenizers import decoders, models, pre_tokenizers, trainers, Tokenizer
 
+# 数据集路径
 DATA_PATH = '../dataset/sft_t2t_mini.jsonl'
+# 保存训练好的tokenizer的目录
 TOKENIZER_DIR = '../model_learn_tokenizer/'
+# 词表大小
 VOCAB_SIZE = 6400
+# 特殊标记的数量
 SPECIAL_TOKENS_NUM = 36
 
+
 def get_texts(data_path):
+    """
+    从数据文件中读取文本数据，每次生成一条文本
+    :param data_path: 数据文件路径
+    :return: 生成器，每次返回一条文本
+    """
     with open(data_path, 'r', encoding='utf-8', errors='ignore') as f:
         for i, line in enumerate(f):
-            if i >= 10000: break # 选10000行测试
+            if i >= 10000: break  # 选10000行测试
             try:
+                # 解析json格式的每一行数据
                 data = json.loads(line)
+                # 提取对话中的内容
                 contents = [item.get('content') for item in data.get('conversations', []) if item.get('content')]
                 if contents:
+                    # 将对话内容合并成一个字符串，以换行符分隔
                     yield "\n".join(contents)
             except json.JSONDecodeError:
                 continue
 
+
 def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
+    """
+    训练tokenizer
+    :param data_path: 训练数据的路径
+    :param tokenizer_dir: 保存训练好的tokenizer的目录
+    :param vocab_size: 词表大小
+    :param special_tokens_num: 特殊标记的数量，默认值为全局变量SPECIAL_TOKENS_NUM
+    :return: 无
+    """
+    # 使用字节对编码（BPE）模型初始化tokenizer
     tokenizer = Tokenizer(models.BPE())
+    # 设置预分词器为字节级，不添加前缀空格
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    
+    # 特殊标记列表
     special_tokens_list = [
-        "<|endoftext|>", "<|im_start|>", "<|im_end|>", 
-        "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", 
-        "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", 
-        "<|audio_start|>", "<|audio_end|>", "<|audio_pad|>", "<tts_pad>", "<tts_text_bos>", "<tts_text_eod>", "<tts_text_bos_single>"
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>",
+        "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>",
+        "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        "<|audio_start|>", "<|audio_end|>", "<|audio_pad|>", "<tts_pad>", "<tts_text_bos>", "<tts_text_eod>",
+        "<tts_text_bos_single>"
     ]
-    
+    # 额外的标记列表
     additional_tokens_list = [
         "<tool_call>", "</tool_call>",
         "<tool_response>", "</tool_response>",
         "<think>", "</think>"
     ]
+    # 计算需要预留的标记数量
     num_buffer = special_tokens_num - len(special_tokens_list + additional_tokens_list)
-    buffer_tokens = [f"<|buffer{i}|>" for i in range(1, num_buffer + 1)] # 预留一定数量的token位置
+    # 生成预留标记列表
+    buffer_tokens = [f"<|buffer{i}|>" for i in range(1, num_buffer + 1)]
+    # 合并所有特殊标记
     all_special_tokens = special_tokens_list + additional_tokens_list + buffer_tokens
+    # 初始化BPE训练器
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         show_progress=True,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         special_tokens=all_special_tokens
     )
+    # 获取训练文本
     texts = get_texts(data_path)
+    # 从文本迭代器中训练tokenizer
     tokenizer.train_from_iterator(texts, trainer=trainer)
+    # 设置解码器为字节级
     tokenizer.decoder = decoders.ByteLevel()
+    # 添加特殊标记
     tokenizer.add_special_tokens(special_tokens_list)
 
     os.makedirs(tokenizer_dir, exist_ok=True)
+    # 保存tokenizer到指定目录
     tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
     tokenizer.model.save(tokenizer_dir)
     tokenizer_json_path = os.path.join(tokenizer_dir, "tokenizer.json")
@@ -62,50 +97,56 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
             token_info['special'] = False
     with open(tokenizer_json_path, 'w', encoding='utf-8') as f:
         json.dump(tokenizer_data, f, ensure_ascii=False, indent=2)
-    
+
     added_tokens_decoder = {}
     for i, token in enumerate(all_special_tokens):
         idx = tokenizer.token_to_id(token)
         added_tokens_decoder[str(idx)] = {
-            "content": token,
-            "lstrip": False,
+            "content"   : token,
+            "lstrip"    : False,
             "normalized": False,
-            "rstrip": False,
+            "rstrip"    : False,
             "single_word": False,
-            "special": True if token in special_tokens_list else False
+            "special"   : True if token in special_tokens_list else False
         }
 
     config = {
-        "add_bos_token": False,
-        "add_eos_token": False,
-        "add_prefix_space": False,
-        "added_tokens_decoder": added_tokens_decoder,
-        "additional_special_tokens": [t for t in special_tokens_list if t not in ["<|endoftext|>"]],
-        "bos_token": "<|im_start|>",
+        "add_bos_token"               : False,
+        "add_eos_token"               : False,
+        "add_prefix_space"            : False,
+        "added_tokens_decoder"        : added_tokens_decoder,
+        "additional_special_tokens"   : [t for t in special_tokens_list if t not in ["<|endoftext|>"]],
+        "bos_token"                   : "<|im_start|>",
         "clean_up_tokenization_spaces": False,
-        "eos_token": "<|im_end|>",
-        "legacy": True,
-        "model_max_length": 131072,
-        "pad_token": "<|endoftext|>",
-        "sp_model_kwargs": {},
+        "eos_token"                   : "<|im_end|>",
+        "legacy"                      : True,
+        "model_max_length"            : 131072,
+        "pad_token"                   : "<|endoftext|>",
+        "sp_model_kwargs"             : {},
         "spaces_between_special_tokens": False,
-        "unk_token": "<|endoftext|>",
-        "image_token": "<|image_pad|>",
-        "audio_token": "<|audio_pad|>",
-        "video_token": "<|video_pad|>",
-        "vision_bos_token": "<|vision_start|>",
-        "vision_eos_token": "<|vision_end|>",
-        "audio_bos_token": "<|audio_start|>",
-        "audio_eos_token": "<|audio_end|>",
-        "chat_template": "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0].role == 'system' %}\n        {{- messages[0].content + '\\n\\n' }}\n    {%- endif %}\n    {{- \"# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}\n        {%- set ns.multi_step_tool = false %}\n        {%- set ns.last_query_index = index %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- if message.content is string %}\n        {%- set content = message.content %}\n    {%- else %}\n        {%- set content = '' %}\n    {%- endif %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- if true %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}\n        {%- endif %}\n        {%- if message.tool_calls %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if (loop.first and content) or (not loop.first) %}\n                    {{- '\\n' }}\n                {%- endif %}\n                {%- if tool_call.function %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {{- '<tool_call>\\n{\"name\": \"' }}\n                {{- tool_call.name }}\n                {{- '\", \"arguments\": ' }}\n                {%- if tool_call.arguments is string %}\n                    {{- tool_call.arguments }}\n                {%- else %}\n                    {{- tool_call.arguments | tojson }}\n                {%- endif %}\n                {{- '}\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.first or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if open_thinking is defined and open_thinking is true %}\n        {{- '<think>\\n' }}\n    {%- else %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}",
-        "tokenizer_class": "PreTrainedTokenizerFast"
+        "unk_token"                   : "<|endoftext|>",
+        "image_token"                 : "<|image_pad|>",
+        "audio_token"                 : "<|audio_pad|>",
+        "video_token"                 : "<|video_pad|>",
+        "vision_bos_token"            : "<|vision_start|>",
+        "vision_eos_token"            : "<|vision_end|>",
+        "audio_bos_token"             : "<|audio_start|>",
+        "audio_eos_token"             : "<|audio_end|>",
+        "chat_template"               : "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0].role == 'system' %}\n        {{- messages[0].content + '\\n\\n' }}\n    {%- endif %}\n    {{- \"# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}\n        {%- set ns.multi_step_tool = false %}\n        {%- set ns.last_query_index = index %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- if message.content is string %}\n        {%- set content = message.content %}\n    {%- else %}\n        {%- set content = '' %}\n    {%- endif %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- if true %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}\n        {%- endif %}\n        {%- if message.tool_calls %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if (loop.first and content) or (not loop.first) %}\n                    {{- '\\n' }}\n                {%- endif %}\n                {%- if tool_call.function %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {{- '<tool_call>\\n{\"name\": \"' }}\n                {{- tool_call.name }}\n                {{- '\", \"arguments\": ' }}\n                {%- if tool_call.arguments is string %}\n                    {{- tool_call.arguments }}\n                {%- else %}\n                    {{- tool_call.arguments | tojson }}\n                {%- endif %}\n                {{- '}\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.first or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if open_thinking is defined and open_thinking is true %}\n        {{- '<think>\\n' }}\n    {%- else %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}",
+        "tokenizer_class"             : "PreTrainedTokenizerFast"
     }
-
+    # 保存tokenizer配置到文件
     with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
     print("Tokenizer training completed.")
 
+
 def eval_tokenizer(tokenizer_dir):
+    """
+    评估训练好的tokenizer
+    :param tokenizer_dir: 训练好的tokenizer所在目录
+    :return: 无
+    """
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     messages = [
@@ -119,15 +160,15 @@ def eval_tokenizer(tokenizer_dir):
         messages,
         tokenize=False
     )
-    print('-'*100)
+    print('-' * 100)
     print(new_prompt)
-    print('-'*100)
+    print('-' * 100)
     print('tokenizer词表长度：', len(tokenizer))
     model_inputs = tokenizer(new_prompt)
     print('encoder长度：', len(model_inputs['input_ids']))
     response = tokenizer.decode(model_inputs['input_ids'], skip_special_tokens=False)
     print('decoder一致性：', response == new_prompt, "\n")
-    print('-'*100)
+    print('-' * 100)
     print('压缩率测试（Chars/Tokens）：')
     test_texts = [
         # 中文样本 (约200字)
@@ -139,7 +180,7 @@ def eval_tokenizer(tokenizer_dir):
         # 混合样本
         "Python 是一种高级编程语言，以其简洁的语法和强大的生态系统而闻名。It is widely used in data science, machine learning, and web development. 开发者可以利用 NumPy, Pandas, and PyTorch 等库快速构建复杂的应用。学习 Python 的过程非常愉快，因为它的代码读起来就像英语一样。Whether you are a beginner or an expert, Python offers something for everyone.",
     ]
-    
+
     total_compression = 0
     for i, text in enumerate(test_texts):
         encoded = tokenizer.encode(text)
@@ -147,10 +188,10 @@ def eval_tokenizer(tokenizer_dir):
         char_count = len(text)
         compression_ratio = char_count / token_count
         total_compression += compression_ratio
-        print(f"样本 {i+1} | 字符数: {char_count:4} | Tokens: {token_count:3} | 压缩率: {compression_ratio:.2f}")
-    
+        print(f"样本 {i + 1} | 字符数: {char_count:4} | Tokens: {token_count:3} | 压缩率: {compression_ratio:.2f}")
+
     print(f"平均压缩率: {total_compression / len(test_texts):.2f}")
-    print('-'*100)
+    print('-' * 100)
     print('流式解码（字节缓冲）测试：')
     input_ids = model_inputs['input_ids']
     token_cache = []
@@ -159,9 +200,11 @@ def eval_tokenizer(tokenizer_dir):
         current_decode = tokenizer.decode(token_cache)
         if current_decode and '\ufffd' not in current_decode:
             display_ids = token_cache[0] if len(token_cache) == 1 else token_cache
-            raw_tokens = [tokenizer.convert_ids_to_tokens(int(t)) for t in (token_cache if isinstance(token_cache, list) else [token_cache])]
+            raw_tokens = [tokenizer.convert_ids_to_tokens(int(t)) for t in
+                          (token_cache if isinstance(token_cache, list) else [token_cache])]
             print(f'Token ID: {str(display_ids):15} -> Raw: {str(raw_tokens):20} -> Decode Str: {current_decode}')
             token_cache = []
+
 
 if __name__ == '__main__':
     train_tokenizer(DATA_PATH, TOKENIZER_DIR, VOCAB_SIZE)
