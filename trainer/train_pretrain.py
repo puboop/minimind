@@ -47,7 +47,12 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         # 它可以在训练后期让学习率逐渐变小，有助于模型更稳定地收敛，避免训练后期因学习率过大而错过最优解。
         # 根据当前的总步数（epoch * iters + step）、总的训练步数（args.epochs * iters）和初始学习率（args.learning_rate）计算当前学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        # 遍历优化器中的参数组，更新每个参数组的学习率
+        # 在深度学习优化器中，optimizer.param_groups 是一个列表，每个元素是一个字典，代表一组参数的配置。这样设计有几个好处：
+        # 不同层设置不同学习率：模型可能有多个层，比如卷积层、全连接层等。不同层的参数更新速度可能需要区别对待。
+        # 例如，预训练模型的早期层通常包含通用特征，更新时可以用较小学习率，避免破坏已学习到的特征；而最后几层通常是针对特定任务的，可能需要较大学习率。
+        # 通过 param_groups，可以为不同层的参数设置不同学习率。
+        # 分组管理超参数：除了学习率，像权重衰减（weight decay）等超参数也可以按组设置。
+        # 这使得在复杂模型中，能更灵活地调整不同参数组的优化超参数，以达到更好的训练效果。
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
