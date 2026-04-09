@@ -141,29 +141,44 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
 
     # 2. 如果启用 YaRN 长度扩展（超长上下文）
     if rope_scaling is not None:
-        # 从配置中读取 YaRN 参数
+        # 外推的最大长度2048，从rope_scaling字典获取原始最大位置嵌入长度，若不存在则设为2048
         orig_max = rope_scaling.get("original_max_position_embeddings", 2048)
+        # 从rope_scaling字典获取缩放因子，若不存在则设为16
         factor = rope_scaling.get("factor", 16)
+        # 计算高频截断位置对应的维度索引
         beta_fast = rope_scaling.get("beta_fast", 32.0)
+        # 计算低频截断位置对应的维度索引
         beta_slow = rope_scaling.get("beta_slow", 1.0)
+        # 注意力缩放因子
         attn_factor = rope_scaling.get("attention_factor", 1.0)
 
-        # 仅当当前最大长度 > 原始训练长度时才做缩放
+        # 仅当当前最大长度（end）与原始训练长度（orig_max）的比值大于1.0时，才进行缩放操作
+        # 意味着当前处理的序列长度超过了原始训练设定的长度，才需要进行YaRN相关调整
         if end / orig_max > 1.0:
-            # 计算低/高频截断位置
+            # inv_dim函数用于计算截断位置对应的维度索引
+            # 它基于给定的参数b（beta_fast或beta_slow）、嵌入维度dim和rope_base计算维度索引
             inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            # 计算低频截断位置，取计算结果与0中的较大值
+            # 低频截断位置用于确定哪些维度的频率缩放较小（几乎不缩放），以保持局部信息
             low = max(math.floor(inv_dim(beta_fast)), 0)
+            # 计算高频截断位置，取计算结果与dim // 2 - 1中的较小值
+            # 高频截断位置用于确定哪些维度的频率缩放较大，以处理长距离依赖信息
             high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
 
             # 生成线性斜坡（ramp）：低维不缩放，高维缩放
+            # torch.arange(dim // 2, device=freqs.device).float()生成从0到dim // 2 - 1的一维张量
+            # 这个张量减去low后，再除以(high - low)，通过torch.clamp将结果限制在0到1之间
+            # 生成的ramp张量用于在不同维度上平滑地过渡缩放因子
             ramp = torch.clamp(
                 (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
                 0, 1
             )
 
-            # YaRN 核心公式：频率缩放，既延长上下文又保持精度
+            # YaRN核心公式：频率缩放，既延长上下文又保持精度
+            # 通过(1 - ramp + ramp / factor)得到一个缩放因子张量
+            # 这个缩放因子张量会根据ramp值，在低维部分接近1（不缩放），在高维部分接近1/factor（缩放）
+            # 将freqs张量的每个元素乘以这个缩放因子张量，实现对频率的缩放调整
             freqs = freqs * (1 - ramp + ramp / factor)
-
     # 3. 生成位置序列 t = [0, 1, 2, ..., end-1]
     t = torch.arange(end, device=freqs.device)
 
