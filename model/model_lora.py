@@ -1,5 +1,5 @@
 import torch
-from torch import optim, nn
+from torch import nn
 
 
 # 定义Lora网络结构
@@ -20,6 +20,28 @@ class LoRA(nn.Module):
 
 def apply_lora(model, rank=16):
     for name, module in model.named_modules():
+        # 寻找每个【多头自注意力层】中q_proj层、o_proj层
+        """
+        在进行LoRA垂直领域训练时，替换多头注意力块的查询者 `q` 与输出结果 `o` 层主要基于以下原因：
+        ### 1. 高效参数微调
+         - **降低参数量**：多头注意力机制在大型语言模型中计算量和参数量都很大。通过在 `q` 和 `o` 层应用LoRA，仅引入少量低秩矩阵（`A` 和 `B`）来微调模型。
+            在垂直领域训练中，数据特点可能与预训练时有所不同，这种低秩调整方式能够以较小的参数量适应新数据分布，避免对整个模型进行大规模参数更新，大大减少了训练成本和计算资源需求。
+         - **快速收敛**：相比全模型微调，LoRA在 `q` 和 `o` 层的微调方式使得模型能够更快地在垂直领域数据上收敛。
+            因为只关注与输入查询和输出相关的关键层，训练过程更具针对性，能更快捕捉到垂直领域数据的特征。
+        
+        ### 2. 注意力机制的关键作用
+         - **查询（`q`）的重要性**：查询 `q` 在多头注意力机制中负责定义要关注的内容。在垂直领域，数据可能具有独特的语义和特征，
+            调整 `q` 层的LoRA可以让模型在注意力计算时更关注与该领域相关的信息。例如，在医疗领域的文本处理中，通过LoRA调整 `q` 层，
+            模型能更聚焦于医学术语、症状描述等关键信息，而忽略无关的通用信息。
+         - **输出（`o`）的作用**：输出 `o` 层将注意力计算后的结果进行整合和转换。在垂直领域，需要模型输出与该领域适配的特征表示。
+            通过LoRA对 `o` 层进行调整，能够使模型生成更符合垂直领域需求的输出，比如在金融领域生成更准确的风险评估特征表示。
+        
+        ### 3. 保持模型通用性与领域特异性的平衡
+         - **通用性保持**：对 `q` 和 `o` 层进行LoRA微调，不会破坏模型在预训练阶段学到的通用知识。因为大部分模型参数保持不变，
+            仅在特定的关键层引入领域相关的微调，模型在处理其他领域任务时仍能利用预训练的通用性。
+         - **特异性增强**：针对垂直领域数据，`q` 和 `o` 层的LoRA微调能够有效增强模型对该领域数据的理解和处理能力。
+            这种平衡使得模型既可以利用预训练的优势，又能在垂直领域表现出色。 
+        """
         if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
             lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(model.device)
             setattr(module, "lora", lora)
@@ -29,6 +51,7 @@ def apply_lora(model, rank=16):
             def forward_with_lora(x, layer1=original_forward, layer2=lora):
                 return layer1(x) + layer2(x)
 
+            # 替换多头注意块的每个多头注意力层的前向传播函数
             module.forward = forward_with_lora
 
 

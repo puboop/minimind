@@ -670,65 +670,159 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         3.生成参数控制：最大长度、停止词、重复惩罚
         4.标准生成接口：generate() 方法
     """
+    # 配置类，用于存储模型的相关配置参数
     config_class = MiniMindConfig
 
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
+        # 创建MiniMindModel实例，传入模型配置
         self.model = MiniMindModel(self.config)
+        # 创建线性层，用于将隐藏状态映射到词汇表大小的维度，作为语言模型的头部，且没有偏置
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 将词嵌入层的权重设置为与语言模型头部的权重相同
         self.model.embed_tokens.weight = self.lm_head.weight
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0,
                 labels=None, **kwargs):
-        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache,
-                                                              **kwargs)
+        """
+        执行模型的前向传播。
+        :param input_ids: 输入的标记ID序列，通常是一个张量，代表输入文本经过分词后的结果。
+        :param attention_mask: 注意力掩码，用于指示哪些位置是有效的输入，1表示有效，0表示无效，默认值为None。
+        :param past_key_values: 过去的键值对，用于缓存之前时间步的计算结果，以便加速生成过程，默认值为None。
+        :param use_cache: 是否使用缓存，即是否利用past_key_values来加速计算，默认值为False。
+        :param logits_to_keep: 用于指定要保留的logits的数量，默认值为0。
+        :param labels: 标签，用于计算损失，通常是目标文本经过分词后的标记ID序列，默认值为None。
+        :param kwargs: 其他可能的关键字参数。
+        :return: 返回一个包含损失、辅助损失、logits、过去的键值对和隐藏状态的输出对象。
+        """
+        # 调用MiniMindModel的前向传播方法，得到隐藏状态、过去的键值对和辅助损失
+        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask,
+                                                              past_key_values, use_cache, **kwargs)
+        # 根据logits_to_keep的值，确定切片的索引
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # 通过语言模型头部，将隐藏状态映射为logits
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # 初始化损失为None
         loss = None
         if labels is not None:
+            # 对logits和标签进行切片，准备计算损失
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
+            # 计算交叉熵损失，忽略标签为-100的部分
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values,
-                                         hidden_states=hidden_states)
+            # 返回包含损失、辅助损失、logits、过去的键值对和隐藏状态的输出对象
+        # 统一输出格式：为所有 MoE 因果语言模型提供一致的返回结构，方便下游代码（训练、生成、评估）统一调用。
+        # 承载专属信息：除了普通因果语言模型的输出外，额外包含 MoE 模型特有的路由与负载均衡信息。
+        # 支持高效生成：携带 past_key_values（键值缓存），用于加速文本生成（推理）。
+        return MoeCausalLMOutputWithPast(
+            loss=loss,
+            aux_loss=aux_loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states
+        )
 
     # https://github.com/jingyaogong/minimind/discussions/611
+    """
+    禁用梯度计算
+        推理 / 生成文本不需要训练，完全用不到反向传播、梯度下降，所以直接关闭梯度相关的所有计算。
+    加速推理
+        关闭梯度跟踪后，前向传播（模型计算）速度更快，大模型生成文本提升非常明显。
+    大幅节省显存
+        不存储梯度、不保留计算图，显存占用直接降低 30%~50%，能让你在小显存显卡上跑更大的模型。
+    """
+
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50,
                  eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True,
                  repetition_penalty=1.0, **kwargs):
+        """
+        执行文本生成。
+        :param inputs: 输入数据，通常是包含初始文本的张量，默认值为None。
+        :param attention_mask: 注意力掩码，用于指示哪些位置是有效的输入，1表示有效，0表示无效，默认值为None。
+        :param max_new_tokens: 要生成的最大新标记数量，默认值为8192。
+        :param temperature: 用于控制生成的随机性，值越高生成越随机，默认值为0.85。
+        :param top_p: 用于核采样（nucleus sampling）的概率阈值，默认值为0.85。
+        :param top_k: 用于Top-K采样的k值，即只考虑概率最高的k个标记，默认值为50。
+        :param eos_token_id: 结束标记的ID，生成遇到该ID时停止，默认值为2。
+        :param streamer: 用于流式输出的对象，默认值为None。
+        :param use_cache: 是否使用缓存，即是否利用past_key_values来加速计算，默认值为True。
+        :param num_return_sequences: 要返回的生成序列数量，默认值为1。
+        :param do_sample: 是否使用采样方式生成，若为False则使用贪心搜索，默认值为True。
+        :param repetition_penalty: 重复惩罚系数，用于惩罚生成中重复出现的标记，默认值为1.0。
+        :param kwargs: 其他可能的关键字参数。
+        :return: 根据是否要求返回键值对，返回生成的ID序列或包含生成ID序列和过去键值对的字典。
+        """
+        # 如果kwargs中没有input_ids，则从inputs中获取，并根据num_return_sequences重复输入
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
+        # 如果存在attention_mask，则根据num_return_sequences重复
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
+        # 从kwargs中获取过去的键值对
         past_key_values = kwargs.pop("past_key_values", None)
+        # 创建一个与input_ids数量相同的布尔张量，用于标记生成是否完成
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        # 如果存在streamer，将当前输入的input_ids放入streamer
         if streamer: streamer.put(input_ids.cpu())
+        # 循环生成max_new_tokens个新的标记
         for _ in range(max_new_tokens):
+            # 获取过去键值对中第一个键值对的长度
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
-            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache,
-                                   **kwargs)
+            # 调用模型的前向传播方法，得到输出
+            outputs = self.forward(input_ids[:, past_len:], attention_mask,
+                                   past_key_values, use_cache=use_cache, **kwargs)
+            # 如果存在attention_mask，则在最后一维添加一个值为1的新维度
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)],
                                        -1) if attention_mask is not None else None
+            # 获取最后一个时间步的logits，并除以温度参数
             logits = outputs.logits[:, -1, :] / temperature
+            # 如果重复惩罚系数不为1.0
             if repetition_penalty != 1.0:
+                # 对每个输入序列，对已经生成过的标记的logits进行惩罚
                 for i in range(input_ids.shape[0]): logits[i, torch.unique(input_ids[i])] /= repetition_penalty
+                # 如果top_k大于0
             if top_k > 0:
+                # 保留logits中top_k个最大值，其余设置为负无穷
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
+                # 如果top_p小于1.0
             if top_p < 1.0:
+                # 对logits进行排序
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                # 计算累积概率掩码
                 mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
+                # 调整掩码，使得第一个位置为0
                 mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
+                # 将掩码对应的logits设置为负无穷
                 logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
-            next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(
-                logits, dim=-1, keepdim=True)
-            if eos_token_id is not None: next_token = torch.where(finished.unsqueeze(-1),
-                                                                  next_token.new_full((next_token.shape[0], 1),
-                                                                                      eos_token_id), next_token)
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            past_key_values = outputs.past_key_values if use_cache else None
-            if streamer: streamer.put(next_token.cpu())
+                # 根据是否采样，决定如何选择下一个标记
+            next_token = (
+                torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
+                if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
+            )
+            # 如果存在结束标记
             if eos_token_id is not None:
+                # 如果已经完成生成，将下一个标记设置为结束标记
+                next_token = torch.where(
+                    finished.unsqueeze(-1),
+                    next_token.new_full((next_token.shape[0], 1), eos_token_id),
+                    next_token
+                )
+                # 将生成的下一个标记连接到input_ids上
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            # 如果使用缓存，更新过去的键值对
+            past_key_values = outputs.past_key_values if use_cache else None
+            # 如果存在streamer，将生成的下一个标记放入streamer
+            if streamer: streamer.put(next_token.cpu())
+            # 如果存在结束标记
+            if eos_token_id is not None:
+                # 更新完成标记
                 finished |= next_token.squeeze(-1).eq(eos_token_id)
+                # 如果所有序列都完成生成，则跳出循环
                 if finished.all(): break
+                # 如果存在streamer，结束streamer
         if streamer: streamer.end()
-        if kwargs.get("return_kv"): return {'generated_ids': input_ids, 'past_kv': past_key_values}
+        # 如果kwargs中要求返回键值对
+        if kwargs.get("return_kv"):
+            # 返回生成的ids和过去的键值对
+            return {'generated_ids': input_ids, 'past_kv': past_key_values}
+            # 返回生成的ids
         return input_ids
