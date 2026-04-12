@@ -316,6 +316,9 @@ class DPODataset(Dataset):
 
 
 class RLAIFDataset(Dataset):
+    """
+    PPO：基于RLAIF机制来训练模型
+    """
     def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
         super().__init__()
         self.tokenizer = tokenizer

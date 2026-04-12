@@ -11,7 +11,7 @@ import requests
 import torch
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoTokenizer
@@ -204,6 +204,25 @@ def create_rollout_engine(
     sglang_model_path: str = None,
     sglang_shared_path: str = None,
 ) -> RolloutEngine:
+    """
+    TorchRolloutEngine
+        模型加载在内存 / 显存里
+        用 model.generate() 直接生成
+        纯 Python + PyTorch
+    SGLangRolloutEngine —— SGLang 高速推理引擎
+        启动一个 SGLang 后台服务
+        Python 端通过 HTTP 请求 调用生成
+        批量生成、PagedAttention、连续批处理，极致优化
+    :param engine_type:
+    :param policy_model:
+    :param tokenizer:
+    :param device:
+    :param autocast_ctx:
+    :param sglang_base_url:
+    :param sglang_model_path:
+    :param sglang_shared_path:
+    :return:
+    """
     if engine_type == "torch":
         return TorchRolloutEngine(policy_model, tokenizer, device, autocast_ctx)
     elif engine_type == "sglang":
