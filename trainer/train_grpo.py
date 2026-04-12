@@ -7,33 +7,38 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import argparse
 import math
 import re
-import gc
 import warnings
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from transformers import AutoTokenizer
 from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import AutoModel
-from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import RLAIFDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
+from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, \
+    SkipBatchSampler, init_model, LMForRewardModel
 from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
 
 warnings.filterwarnings('ignore')
 
 
 def rep_penalty(text, n=3, cap=0.5):
+    # 提取文本 token，计算 n-gram 重复
+    # 返回重复惩罚值：重复越多，惩罚越高
     toks = re.findall(r"\w+|[^\w\s]", text.lower())
     grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
     return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
 
 def calculate_rewards(prompts, responses, reward_model):
+    # 长度奖励：20~800 字加分，太短太长扣分
+    # 思考链奖励：包含 ... 且长度合理 → 大幅加分
+    # 重复惩罚：调用 rep_penalty 扣重复分
+    # 奖励模型打分：用专业 Reward Model 给回答质量打分（最核心）
+    # 输出：每条生成回答的最终奖励分数
     rewards = torch.zeros(len(responses), device=args.device)
 
     with torch.no_grad():
@@ -67,7 +72,34 @@ def calculate_rewards(prompts, responses, reward_model):
     return rewards
 
 
-def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model, start_step=0, wandb=None, use_sglang=False):
+def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model, start_step=0, wandb=None,
+                     use_sglang=False):
+    """
+    同一 prompt 的 6 条回答互相对比
+    比本组平均分高 → 正向优势（鼓励）
+    比本组平均分低 → 负向优势（惩罚）
+    优势 = (分数 - 组均值) / 组标准差
+    解析参数：batch size、学习率、生成长度、模型路径等
+    初始化环境：分布式、随机种子、混合精度
+    初始化 3 大模型
+    Policy 模型：要训练的主模型（会更新）
+    Ref 参考模型：固定不动，用于计算 KL 散度
+    Reward 奖励模型：固定不动，给回答打分
+    数据加载：RLAIF 对话数据集
+    启动训练循环：多 epoch 训练
+    让大模型对着同一个问题一口气生成好几条答案，自己和自己比，好的奖励、差的惩罚，用 GRPO 算法不断优化，最终让模型越来越会回答问题。
+    清理资源
+    :param epoch:
+    :param loader:
+    :param iters:
+    :param rollout_engine:
+    :param ref_model:
+    :param reward_model:
+    :param start_step:
+    :param wandb:
+    :param use_sglang:
+    :return:
+    """
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch['prompt']  # list[str], length B
         prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False,
@@ -94,11 +126,12 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                 res = model_unwrapped(outputs)
                 aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
                 logits = res.logits[:, :-1, :]
-                per_token_logps = F.log_softmax(logits, dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1)[:, -completion_ids.size(1):]
+                per_token_logps = F.log_softmax(logits, dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1)[
+                    :, -completion_ids.size(1):]
             else:
                 aux_loss = torch.tensor(0.0, device=args.device)
                 per_token_logps = rollout_result.per_token_logps
-        
+
         with torch.no_grad():
             ref_per_token_logps = compute_per_token_logps(ref_model, outputs, completion_ids.size(1))
         rewards = calculate_rewards(prompts, completions, reward_model).to(args.device)  # [B*num_gen]
@@ -106,7 +139,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
             for i in range(len(prompts)):
                 Logger(f"[DEBUG] step={step}, sample[{i}]")
-                Logger('-'*100)
+                Logger('-' * 100)
                 Logger(f"{'=' * 30} [DEBUG] sample[{i}] CONTEXT_BEGIN {'=' * 30}")
                 Logger(prompts[i])
                 Logger(f"{'=' * 31} [DEBUG] sample[{i}] CONTEXT_END {'=' * 31}")
@@ -116,7 +149,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                     Logger(completions[idx])
                     Logger(f"{'=' * 29} [DEBUG] gen[{j}] RESPONSE_END {'=' * 29}")
                     Logger(f"[DEBUG] gen[{j}] reward={rewards[idx].item():.4f}")
-                Logger('='*100)
+                Logger('=' * 100)
 
         grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
@@ -126,7 +159,10 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        completion_mask = (torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)).int()  # [B*num_gen, R]
+        completion_mask = (
+            (torch.arange(is_eos.size(1), device=args.device)
+             .expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)).int()
+        )  # [B*num_gen, R]
 
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
@@ -156,25 +192,35 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             current_aux_loss = aux_loss.item()
             avg_reward_val = rewards.mean().item()
             avg_len_val = completion_mask.sum(dim=1).float().mean().item()
-            kl_ref_val = ((ref_per_token_logps - per_token_logps) * completion_mask).sum().item() / completion_mask.sum().item()
+            kl_ref_val = (
+                    (
+                            (ref_per_token_logps - per_token_logps) * completion_mask
+                    ).sum().item()
+                    / completion_mask.sum().item()
+            )
             advantages_mean_val = advantages.mean().item()
             advantages_std_val = advantages.std().item()
             current_lr = optimizer.param_groups[0]['lr']
 
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
-                   f'Reward: {avg_reward_val:.4f}, KL_ref: {kl_ref_val:.4f}, '
-                   f'Adv Std: {advantages_std_val:.4f}, Adv Mean: {advantages_mean_val:.4f}, '
-                   f'Actor Loss: {policy_loss_val:.4f}, Avg Response Len: {avg_len_val:.2f}, Learning Rate: {current_lr:.8f}')
+            Logger(
+                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
+                f'Reward: {avg_reward_val:.4f}, '
+                f'KL_ref: {kl_ref_val:.4f}, '
+                f'Adv Std: {advantages_std_val:.4f},'
+                f' Adv Mean: {advantages_mean_val:.4f}, '
+                f'Actor Loss: {policy_loss_val:.4f}, '
+                f'Avg Response Len: {avg_len_val:.2f}, Learning Rate: {current_lr:.8f}'
+            )
 
             if wandb and is_main_process():
                 wandb.log({
-                    "reward": avg_reward_val,
-                    "kl_ref": kl_ref_val,
-                    "advantages_std": advantages_std_val,
+                    "reward"         : avg_reward_val,
+                    "kl_ref"         : kl_ref_val,
+                    "advantages_std" : advantages_std_val,
                     "advantages_mean": advantages_mean_val,
-                    "policy_loss": policy_loss_val,
+                    "policy_loss"    : policy_loss_val,
                     "avg_response_len": avg_len_val,
-                    "learning_rate": current_lr
+                    "learning_rate"  : current_lr
                 })
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
@@ -185,8 +231,8 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
+                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
             model.train()
             del state_dict
 
@@ -232,11 +278,13 @@ if __name__ == "__main__":
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-GRPO", help="wandb项目名")
-    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1],
+                        help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument("--debug_mode", action="store_true", help="是否打印训练调试采样")
     parser.add_argument("--debug_interval", type=int, default=20, help="debug模式下每隔多少step打印一次采样")
     parser.add_argument("--thinking_ratio", type=float, default=0.9, help="按概率开启thinking（0.0~1.0）")
-    parser.add_argument("--rollout_engine", type=str, default="sglang", choices=["torch", "sglang"], help="rollout引擎类型")
+    parser.add_argument("--rollout_engine", type=str, default="sglang", choices=["torch", "sglang"],
+                        help="rollout引擎类型")
     parser.add_argument("--sglang_base_url", type=str, default="http://localhost:8996", help="SGLang服务器URL")
     parser.add_argument("--sglang_model_path", type=str, default="../model", help="SGLang tokenizer路径")
     parser.add_argument("--sglang_shared_path", type=str, default="./sglang_ckpt_grpo", help="SGLang共享存储路径")
@@ -246,27 +294,29 @@ if __name__ == "__main__":
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
+                             save_dir='../checkpoints') if args.from_resume == 1 else None
+
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
+
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
+
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-GRPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
+
     # ========== 5. 初始化模型和数据 ==========
     base_weight = args.from_weight
     # Policy模型
@@ -288,14 +338,15 @@ if __name__ == "__main__":
         sglang_shared_path=args.sglang_shared_path,
     )
     # 数据和优化器
-    train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len, thinking_ratio=args.thinking_ratio)
+    train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len,
+                            thinking_ratio=args.thinking_ratio)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
     total_optimizer_steps = math.ceil(iters / args.accumulation_steps) * args.epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
-    
+
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -304,7 +355,7 @@ if __name__ == "__main__":
         scheduler.load_state_dict(ckp_data['scheduler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-    
+
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
         model = torch.compile(model)
@@ -314,19 +365,22 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     if is_main_process(): rollout_engine.update_policy(model)
-    
+
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(42 + epoch);
+        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-        if skip > 0: 
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            grpo_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step, wandb, use_sglang = (args.rollout_engine == "sglang"))
+            grpo_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step,
+                             wandb, use_sglang=(args.rollout_engine == "sglang"))
         else:
-            grpo_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb, use_sglang = (args.rollout_engine == "sglang"))
-    
+            grpo_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb,
+                             use_sglang=(args.rollout_engine == "sglang"))
+
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized(): dist.destroy_process_group()
